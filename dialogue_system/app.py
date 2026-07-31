@@ -190,6 +190,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         return
 
     try:
+        t_pipeline_start = time.time()  # [Timing] Pipeline start for E2E latency
         # 1. ASR Phase (Automatic Speech Recognition)
         if asr is None:
             # Fallback if ASR is handled by internal TurnTaking module
@@ -252,6 +253,9 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         emit_to_room(client_id, "user_transcription", {"text": asr_text})
 
         llm.add_message(client_id, "user", asr_text)
+        t_llm_start = time.time()           # [Timing] LLM generation start (for TTFT)
+        t_llm_first_chunk = None            # [Timing] Will be set on first LLM chunk
+        t_tts_first_audio = None            # [Timing] Will be set on first TTS audio chunk
         llm_reply_gen = llm.generate_with_history(
             client_id, stop_event=current_stop_event
         )
@@ -271,9 +275,18 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         ):
             if current_stop_event.is_set():
                 interrupted = True
+                if session.interruption_time:
+                    logger.info(  # [Timing] From barge-in arrival to LLM loop detection
+                        f"[{client_id}] Interrupt Latency (LLM loop): {time.time() - session.interruption_time:.3f}s"
+                    )
                 break
 
             logger.info(f"[{client_id}] LLM Chunk: {chunk}")
+            if t_llm_first_chunk is None:
+                t_llm_first_chunk = time.time()  # [Timing] First LLM token received
+                logger.info(  # [Timing] Time To First Token from LLM
+                    f"[{client_id}] LLM TTFT: {t_llm_first_chunk - t_llm_start:.3f}s"
+                )
 
             # Send LLM text chunk immediately
             emit_to_room(client_id, "text_response", {"text": chunk})
@@ -285,10 +298,20 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
             for wav_chunk in tts.synthesize(chunk, streaming=True):
                 if current_stop_event.is_set():
                     interrupted = True
+                    if session.interruption_time:
+                        logger.info(  # [Timing] From barge-in arrival to TTS loop detection
+                            f"[{client_id}] Interrupt Latency (TTS loop): {time.time() - session.interruption_time:.3f}s"
+                        )
                     break
 
                 if first_emit_time is None:
                     first_emit_time = time.time()
+                if t_tts_first_audio is None:
+                    t_tts_first_audio = time.time()  # [Timing] First TTS audio emitted
+                    logger.info(  # [Timing] TTS first chunk latency + E2E first audio
+                        f"[{client_id}] TTS First Audio: {t_tts_first_audio - t_llm_first_chunk:.3f}s"
+                        f" | E2E First Audio: {t_tts_first_audio - t_pipeline_start:.3f}s"
+                    )
 
                 # Calculate audio duration: bytes / (sample_rate * channels * bytes_per_sample)
                 # Assuming 24k sample rate, 1 channel, 16-bit (2 bytes) = 48000 bytes/sec
@@ -298,7 +321,21 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
 
             if current_stop_event.is_set():
                 interrupted = True
+                if session.interruption_time:
+                    logger.info(  # [Timing] From barge-in arrival to post-TTS detection
+                        f"[{client_id}] Interrupt Latency (post-TTS): {time.time() - session.interruption_time:.3f}s"
+                    )
                 break
+
+        # [Timing] LLM & TTS total generation duration
+        if t_llm_first_chunk is not None:
+            logger.info(
+                f"[{client_id}] LLM Total: {time.time() - t_llm_first_chunk:.3f}s"
+            )
+        if t_tts_first_audio is not None:
+            logger.info(
+                f"[{client_id}] TTS Total: {time.time() - t_tts_first_audio:.3f}s"
+            )
 
         if interrupted:
             # If interrupted mid-stream, calculate truncation immediately using current time
@@ -331,6 +368,10 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 session.pending_audio_duration = total_audio_duration
                 session.pending_start_time = first_emit_time
                 session.interruption_time = None
+
+        logger.info(  # [Timing] Total E2E pipeline time (start → finish)
+            f"[{client_id}] E2E Complete: {time.time() - t_pipeline_start:.3f}s"
+        )
 
     except Exception as e:
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
@@ -389,6 +430,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if "bytes" in message and message["bytes"]:
                 # Binary Audio Data
+                _t_vad_recv = time.time()  # [Timing] Audio bytes received
                 data = message["bytes"]
                 # Convert buffer to float32
                 audio_chunk = (
@@ -403,6 +445,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 with session.lock:
                     segment = session.vad.process(audio_chunk)
+                _t_vad_done = time.time()  # [Timing] VAD processing completed
 
                 if segment is not None:
                     if isinstance(segment, list) and segment[0] is None:
@@ -411,6 +454,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             session.interruption_time = time.time()
                         session.interrupt()
                     else:
+                        logger.info(  # [Timing] VAD roundtrip: audio in → utterance out
+                            f"[{client_id}] VAD Process: {_t_vad_done - _t_vad_recv:.3f}s"
+                            f" | Utterance: {segment}"
+                        )
                         # Complete Utterance
                         threading.Thread(
                             target=pipeline_worker,

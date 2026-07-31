@@ -20,12 +20,12 @@ infer_config:
   developer_mode: false
 
   input:
-    chunk_size: 2560
+    chunk_size: 5120
     audio_back_size: 15360
     audio_ahead_size: 640
     sample_rate: 16000
 
   asr:
-    model_name: paraformer
-    # model_name: sensevoice
-    # language: en
+    model_name: sensevoice
+    # model_name: sensevoice/paraformer/whisper
+    language: auto

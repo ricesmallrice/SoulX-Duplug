@@ -15,7 +15,7 @@ class TurnTaking:
         circle_callback=None,
         server_url="ws://localhost:8000/turn",
         client_id=None,
-        timeout=1.0,
+        timeout=10.0,
     ):
         self.client_id = client_id or uuid.uuid4().hex
         self.timeout = timeout

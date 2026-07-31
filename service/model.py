@@ -61,10 +61,12 @@ class TurnModel:
             self.embed_tokens_func = self.model.llm.model.model.model.embed_tokens
 
         # if self.config.model_config.enable_cascade_asr:
-        from model.asr import ParaformerASR, SensevoiceASR
+        from model.asr import ParaformerASR, SensevoiceASR, WhisperASR
 
         if config.infer_config.asr.model_name == "paraformer":
             self.cascade_asr = ParaformerASR()
+        elif config.infer_config.asr.model_name == "whisper":
+            self.cascade_asr = WhisperASR()
         else:
             self.cascade_asr = SensevoiceASR(
                 language=config.infer_config.asr.get("language", "auto")
@@ -123,10 +125,17 @@ class TurnModel:
         self.buffer_for_asr = np.random.randn(int(1.6 * self.sampling_rate)) * 0.00001
         self.cascade_buffer = np.random.randn(int(3.2 * self.sampling_rate)) * 0.00001
         self.speech_detected = False
+        self._vad_start_time = 0.0  # [Timing] VAD start timestamp for VAD Start/End logging
         self.past_state = None
         self.history_chunks = []
         self.wait_idle_cnt = 0
         self.monitoring_wait_silence = False
+        # [Timing] Per-chunk timing state (set by _asr / _state_predict / infer)
+        self._last_llm_check_t = 0.0
+        self._last_asr_t = None
+        self._last_asr_text = ""
+        self._last_speech_detected = False
+        self._last_state_t = 0.0
 
     def clear_turn(self):
         self.buffer_for_asr = np.random.randn(int(1.6 * self.sampling_rate)) * 0.00001
@@ -271,6 +280,8 @@ class TurnModel:
                         segment = self.cascade_asr.recognize(
                             self.buffer_for_asr, self.sampling_rate
                         )
+                        vad_dur = time.time() - self._vad_start_time
+                        print(f"[TurnTiming] VAD End: {vad_dur:.3f}s | Text: {segment}")
                         # self.clear_turn()
                         self.reset()
                         return {
@@ -288,6 +299,9 @@ class TurnModel:
                 self.reset()
 
         elif state == "<|user_nonidle|>":
+            if not self.speech_detected:
+                self._vad_start_time = time.time()
+                print(f"[TurnTiming] VAD Start")
             self._log("Speech detected", self.get_rms(process_chunk.astype(np.float32)))
             self.speech_detected = True
 
@@ -330,6 +344,10 @@ class TurnModel:
             # self._log("Backchannel detected")
             if not self.speech_detected:
                 self.reset()
+            else:
+                self.buffer_for_asr = np.concatenate(
+                    [self.buffer_for_asr, process_chunk]
+                )
             if self.monitoring_wait_silence:
                 self.wait_idle_cnt = 1
 
@@ -342,6 +360,8 @@ class TurnModel:
                 segment = self.cascade_asr.recognize(
                     self.buffer_for_asr, self.sampling_rate
                 )
+                vad_dur = time.time() - self._vad_start_time
+                print(f"[TurnTiming] VAD End: {vad_dur:.3f}s | Text: {segment}")
                 # self.clear_turn()
                 self.reset()
                 return {
@@ -387,6 +407,7 @@ class TurnModel:
                 "checkpoint": None,
             }
 
+        t_encode = time.time()  # [Timing] Start of full chunk processing
         audio_tokens = self._audio_to_tokens(audio_back, audio_chunk, audio_ahead)
 
         audio_embeds = self._tokens_to_embeds(audio_tokens)
@@ -394,10 +415,26 @@ class TurnModel:
         self.past_state["input_embeds"] = torch.cat(
             (self.past_state["input_embeds"], audio_embeds), dim=0
         ).unsqueeze(0)
+        _encode_t = time.time() - t_encode  # [Timing] Audio encode + embed + concat
 
         delta_text = self._asr(audio_embeds)
 
         state = self._state_predict(delta_text)
+
+        # [Timing] Print full per-chunk latency: Encode + LLM Check + ASR + State Prediction
+        if self._last_speech_detected:
+            print(f"[TurnTiming] Enc: {_encode_t:.4f}s | "
+                  f"Chk: {self._last_llm_check_t:.4f}s | "
+                  f"ASR: {self._last_asr_t:.4f}s | "
+                  f"St: {self._last_state_t:.4f}s | "
+                  f"Total: {_encode_t + self._last_llm_check_t + self._last_asr_t + self._last_state_t:.4f}s | "
+                  f"Text: {self._last_asr_text}")
+        else:
+            print(f"[TurnTiming] Enc: {_encode_t:.4f}s | "
+                  f"Chk: {self._last_llm_check_t:.4f}s | "
+                  f"St: {self._last_state_t:.4f}s | "
+                  f"Total: {_encode_t + self._last_llm_check_t + self._last_state_t:.4f}s | "
+                  f"No speech")
 
         del audio_embeds
         torch.cuda.empty_cache()
@@ -488,7 +525,8 @@ class TurnModel:
             logits = outputs.logits[0]
             current_kv = outputs.past_key_values
             pred = torch.argmax(logits, -1)[-1]
-            self._log(f"[Timing] LLM check: {time.time() - t_llm_check:.4f}s")
+            self._last_llm_check_t = time.time() - t_llm_check  # [Timing] LLM check latency
+            self._log(f"[Timing] LLM check: {self._last_llm_check_t:.4f}s")
 
             delta_text = ""
             need_correction = False
@@ -500,7 +538,10 @@ class TurnModel:
                 full_text = remove_leading_backchannel(
                     self.cascade_asr.recognize(self.cascade_buffer, self.sampling_rate)
                 )
-                self._log(f"[Timing] Cascade ASR: {time.time() - t_asr:.4f}s")
+                self._last_asr_t = time.time() - t_asr  # [Timing] Cascade ASR latency
+                self._last_asr_text = full_text
+                self._last_speech_detected = True
+                self._log(f"[Timing] Cascade ASR: {self._last_asr_t:.4f}s")
 
                 # Process Text Delta
                 history_text = self.past_state.get("cascade_text", "")
@@ -596,6 +637,12 @@ class TurnModel:
                 self._log(f"[Need Correction]: {need_correction}")
                 self._log(f"[Prev Delta]: {corrected_prev_delta}")
                 self._log(f"[Delta]: {delta_text}")
+
+            else:
+                # No speech detected
+                self._last_asr_t = None
+                self._last_asr_text = ""
+                self._last_speech_detected = False
 
             if need_correction and self.past_state["checkpoint"] is not None:
                 self._log("--- Correction Triggered ---")
@@ -715,7 +762,8 @@ class TurnModel:
 
         self.past_state["past_key_values"] = outputs.past_key_values
         self.past_state["state"] = state
-        self._log(f"[Timing] State pred: {time.time() - t_state:.4f}s")
+        self._last_state_t = time.time() - t_state  # [Timing] State prediction latency
+        self._log(f"[Timing] State pred: {self._last_state_t:.4f}s")
         return state
 
 

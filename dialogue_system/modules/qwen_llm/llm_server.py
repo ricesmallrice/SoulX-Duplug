@@ -38,7 +38,7 @@ class StopOnDisconnect(StoppingCriteria):
         return self.should_stop
 
 
-def load_model(model_path: str, config_path: str):
+def load_model(model_path: str, config_path: str, device: str = None):
     global tokenizer, model, gen_kwargs, index_tts, cosyvoice
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -47,8 +47,9 @@ def load_model(model_path: str, config_path: str):
     print(f"Loading model: {model_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    device_map = device if device else "auto"
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, device_map="auto", torch_dtype="auto", trust_remote_code=True
+        model_path, device_map=device_map, torch_dtype="auto", trust_remote_code=True
     ).eval()
 
     gen_kwargs = {
@@ -329,7 +330,9 @@ if __name__ == "__main__":
         default=os.path.join(os.path.dirname(__file__), "config.yaml"),
     )
     parser.add_argument("--model_dir", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None,
+                        help="GPU device, e.g. cuda:0. Default uses device_map='auto'")
     args = parser.parse_args()
 
-    load_model(args.model_dir, args.config)
+    load_model(args.model_dir, args.config, args.device)
     uvicorn.run(app, host=args.host, port=args.port)

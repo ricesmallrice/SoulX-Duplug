@@ -91,17 +91,60 @@ class SensevoiceASR:
             language = self.language
 
         try:
-            result = self.rich_transcription_postprocess(
-                self.sensevoice_model.generate(
-                    input=audio_chunk,
-                    cache={},
-                    language=language,  # "zh", "en", "yue", "ja", "ko", "nospeech"
-                    use_itn=True,
-                    batch_size=16,
-                )[0]["text"]
-            ).strip()
+            raw = self.sensevoice_model.generate(
+                input=audio_chunk,
+                cache={},
+                language=language,  # "zh", "en", "yue", "ja", "ko", "nospeech"
+                use_itn=True,
+                batch_size=16,
+            )[0]["text"]
+            # Extract language tag (e.g. <|zh|>, <|en|>) from raw output
+            lang_tag = ""
+            m = re.match(r"<\|[a-z]+\|>", raw)
+            if m:
+                lang_tag = m.group()
+            result = self.rich_transcription_postprocess(raw).strip()
             result = self.clean_sensevoice_text(result)
+            print(f"[SensevoiceLang] {lang_tag} | Text: {result}")
         except Exception as e:
             print("ASR recognition failed:", e)
             result = ""
         return result
+
+
+class WhisperASR:
+    """Whisper-medium based ASR for cascade recognition."""
+
+    def __init__(self, model_path="pretrained_models/whisper-medium"):
+        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
+        self.processor = WhisperProcessor.from_pretrained(model_path)
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_path)
+        self.model.to("cuda")
+        # Auto-detect language (no forced_decoder_ids)
+        self.model.config.forced_decoder_ids = None
+
+    def recognize(self, audio_chunk, sample_rate=16000):
+        try:
+            if audio_chunk.ndim > 1:
+                audio_chunk = audio_chunk.mean(axis=1)
+            if sample_rate != 16000:
+                audio_chunk = soxr.resample(audio_chunk, sample_rate, 16000)
+
+            input_features = self.processor(
+                audio_chunk, sampling_rate=16000, return_tensors="pt"
+            ).input_features.to("cuda")
+
+            with torch.no_grad():
+                predicted_ids = self.model.generate(input_features)
+            # Print detected language tag + text
+            lang_id = predicted_ids[0, 1].item()
+            lang = self.processor.tokenizer.decode([lang_id]).strip()
+            text = self.processor.batch_decode(
+                predicted_ids, skip_special_tokens=True
+            )[0].strip()
+            print(f"[WhisperLang] {lang} | Text: {text}")
+        except Exception as e:
+            print("Whisper ASR recognition failed:", e)
+            text = ""
+        return text
