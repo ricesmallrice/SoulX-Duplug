@@ -3,6 +3,8 @@ import time
 import soxr
 import queue
 import base64
+import socket
+import struct
 import logging
 import threading
 import uuid
@@ -39,6 +41,44 @@ async def add_security_headers(request: Request, call_next):
 # Global event loop reference for thread-safe websocket sending
 main_loop = None
 
+# Remote relay subscribers: forward audio stream & control events to other machines
+relay_connections = set()
+relay_lock = threading.Lock()
+
+# UDP channel (--udp_target). When enabled, audio goes via UDP only (one channel at a time).
+udp_sender = None
+
+# UDP packet format: [type:1B][seq:4B][payload_len:2B][payload]
+#   type=0 audio (payload = raw int16 PCM), type=1 control (payload = control code)
+UDP_MAX_PAYLOAD = 1200  # keep below MTU to avoid IP fragmentation
+UDP_CTRL = {"stop_audio": 0, "pause_audio": 1, "resume_audio": 2}
+
+
+class UdpSender:
+    """Best-effort UDP sender for the audio stream / control events."""
+
+    def __init__(self, target: str):
+        host, port = target.rsplit(":", 1)
+        self.addr = (host, int(port))
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.seq = 0
+        logger.info(f"UDP channel enabled -> {target}")
+
+    def send_audio(self, data: bytes):
+        for i in range(0, len(data), UDP_MAX_PAYLOAD):
+            chunk = data[i : i + UDP_MAX_PAYLOAD]
+            pkt = struct.pack(">BIH", 0, self.seq, len(chunk)) + chunk
+            self.sock.sendto(pkt, self.addr)
+            self.seq += 1
+
+    def send_event(self, event: str, data):
+        code = UDP_CTRL.get(event)
+        if code is None:
+            return  # UI-only events are not forwarded over UDP
+        pkt = struct.pack(">BIH", 1, self.seq, 1) + bytes([code])
+        self.sock.sendto(pkt, self.addr)
+        self.seq += 1
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -62,8 +102,10 @@ class ChatSession:
         self.vad = vad_instance
         self.websocket = websocket
         self.lock = threading.Lock()
+        self.vad_lock = threading.Lock()  # 序列化 VAD 调用（浏览器麦克风 / UDP 远端麦克风）
         self._stop_event = threading.Event()  # Internal event to signal interruption
         self.is_active = True
+        self.uses_remote_mic = False  # 是否使用 UDP 转发来的远端麦克风
 
         # Audio config
         self.input_sample_rate = Config.SAMPLE_RATE
@@ -161,23 +203,63 @@ def emit_to_room(client_id, event, data):
 
     ws = session.websocket
 
-    if ws.client_state != WebSocketState.CONNECTED:
-        return
-
     # Helper wrapper to run async send in the main loop
     async def _send():
-        try:
-            if event == "audio_chunk":
-                # Audio data: send raw bytes
-                await ws.send_bytes(data)
-            else:
-                # Text/JSON data
-                message = json.dumps({"event": event, "data": data})
-                await ws.send_text(message)
-        except Exception as e:
-            logger.error(f"Failed to send to {client_id}: {e}")
+        # 1. Send to the local session websocket
+        if ws.client_state == WebSocketState.CONNECTED:
+            try:
+                if event == "audio_chunk":
+                    # Audio data: send raw bytes
+                    await ws.send_bytes(data)
+                else:
+                    # Text/JSON data
+                    message = json.dumps({"event": event, "data": data})
+                    await ws.send_text(message)
+            except Exception as e:
+                logger.error(f"Failed to send to {client_id}: {e}")
+
+        # 2. Forward to remote relay subscribers (raw bytes for audio, JSON for events)
+        await _relay_forward(event, data)
 
     asyncio.run_coroutine_threadsafe(_send(), main_loop)
+
+
+async def _relay_forward(event, data):
+    """Forward audio chunks / control events to the remote (UDP or WebSocket relay)."""
+    global udp_sender
+
+    # One channel at a time: if UDP is enabled, WS relay is not used
+    if udp_sender is not None:
+        if event == "audio_chunk":
+            udp_sender.send_audio(data)
+        # 不再发送控制事件（如 stop_audio），远端依赖数据流中断自然停播
+        return
+
+    if not relay_connections:
+        return
+
+    with relay_lock:
+        targets = list(relay_connections)
+
+    failed = []
+    for rws in targets:
+        try:
+            if rws.client_state != WebSocketState.CONNECTED:
+                failed.append(rws)
+                continue
+            if event == "audio_chunk":
+                await rws.send_bytes(data)
+            else:
+                message = json.dumps({"event": event, "data": data})
+                await rws.send_text(message)
+        except Exception as e:
+            logger.error(f"Relay send failed: {e}")
+            failed.append(rws)
+
+    if failed:
+        with relay_lock:
+            for rws in failed:
+                relay_connections.discard(rws)
 
 
 def pipeline_worker(client_id, audio_segment, sample_rate):
@@ -377,6 +459,95 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
 
 
+# ==== Remote Mic UDP Receiver ====
+# 远端麦克风通过 UDP 转发过来（见 remote_mic_udp.py），
+# 与浏览器麦克风走完全相同的 VAD -> 打断/发言 处理路径。
+# 数据包格式与 UdpSender 一致: [type:1B][seq:4B][payload_len:2B][payload]
+MIC_UDP_PKT_HEADER = 7
+mic_audio_queue = queue.Queue(maxsize=64)
+
+
+def pick_mic_session():
+    """选择接收远端麦克风音频的会话：优先显式启用远端麦克风的会话，否则取最近活跃的会话。"""
+    with session_manager._lock:
+        candidates = list(session_manager.sessions.values())
+    for s in reversed(candidates):
+        if s.is_active and s.uses_remote_mic:
+            return s
+    for s in reversed(candidates):
+        if s.is_active:
+            return s
+    return None
+
+
+def mic_vad_worker():
+    """从队列取远端麦克风音频送入 VAD，处理结果与浏览器麦克风一致。"""
+    while True:
+        chunk = mic_audio_queue.get()
+        session = pick_mic_session()
+        if session is None:
+            continue
+        try:
+            with session.vad_lock:
+                segment = session.vad.process(chunk)
+            if segment is not None:
+                if isinstance(segment, list) and segment[0] is None:
+                    # Barge-in（打断当前回复）
+                    if session.interruption_time is None:
+                        session.interruption_time = time.time()
+                    session.interrupt()
+                else:
+                    threading.Thread(
+                        target=pipeline_worker,
+                        args=(session.client_id, segment, Config.SAMPLE_RATE),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            logger.error(f"[mic-udp] VAD process failed: {e}", exc_info=True)
+
+
+def mic_udp_receiver(port):
+    """接收远端麦克风 UDP 音频包，放入队列供 mic_vad_worker 处理。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", port))
+    sock.settimeout(0.5)
+    logger.info(f"[mic-udp] listening on 0.0.0.0:{port} for remote microphone")
+    pkt_count = 0
+    last_log = time.time()
+    while True:
+        try:
+            pkt, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        # 周期性打印接收统计，便于确认 UDP 麦克风链路是否打通
+        pkt_count += 1
+        now = time.time()
+        if now - last_log >= 5.0:
+            logger.info(
+                f"[mic-udp] received {pkt_count} packets in last {now - last_log:.1f}s"
+            )
+            pkt_count = 0
+            last_log = now
+        if len(pkt) < MIC_UDP_PKT_HEADER:
+            continue
+        ptype, seq, plen = struct.unpack(">BIH", pkt[:MIC_UDP_PKT_HEADER])
+        if ptype != 0:
+            continue
+        payload = pkt[MIC_UDP_PKT_HEADER : MIC_UDP_PKT_HEADER + plen]
+        if not payload or len(payload) % 2 != 0:
+            continue
+        audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
+        try:
+            mic_audio_queue.put_nowait(audio)
+        except queue.Full:
+            # VAD 处理不过来时丢弃最旧的数据，保持实时
+            try:
+                mic_audio_queue.get_nowait()
+                mic_audio_queue.put_nowait(audio)
+            except queue.Empty:
+                pass
+
+
 # ==== WebSocket Endpoint & Processing ====
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -443,7 +614,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_chunk, current_sr, Config.SAMPLE_RATE, quality="VHQ"
                     )
 
-                with session.lock:
+                with session.vad_lock:
                     segment = session.vad.process(audio_chunk)
                 _t_vad_done = time.time()  # [Timing] VAD processing completed
 
@@ -485,6 +656,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         if sr:
                             session.input_sample_rate = int(sr)
                             logger.info(f"[{client_id}] Sample rate set to {sr}")
+                        # 标记使用 UDP 转发的远端麦克风，浏览器自身不再采集麦克风
+                        if sr_data.get("source") == "remote_mic":
+                            session.uses_remote_mic = True
+                            logger.info(f"[{client_id}] Remote mic (UDP) enabled")
 
                 except json.JSONDecodeError:
                     logger.warning(f"[{client_id}] Received invalid JSON")
@@ -502,12 +677,70 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Session cleaned up: {client_id}")
 
 
+# ==== Remote Relay Endpoint ====
+@app.websocket("/ws/relay")
+async def relay_endpoint(websocket: WebSocket):
+    """
+    远端旁听端点：订阅当前会话的音频流与控制事件。
+
+    远端只收不发：
+      - 二进制帧 = int16 PCM（24000 Hz / 单声道），直接送扬声器
+      - JSON 帧   = {"event": "...", "data": {...}}，如 stop_audio / pause_audio ...
+    连接后即可实时收到本机网页相同的 audio_chunk 与 stop_audio。
+    """
+    await websocket.accept()
+    with relay_lock:
+        relay_connections.add(websocket)
+    logger.info(f"Relay subscriber connected: {websocket.client.host}")
+
+    try:
+        # 远端一般只收不发；这里持续接收以感知断开（收到任意内容即忽略）
+        while True:
+            message = await websocket.receive()
+            if "text" in message and message["text"]:
+                # 可选支持 ping/pong 或自定义控制
+                logger.debug(f"Relay message ignored: {message['text']}")
+    except WebSocketDisconnect:
+        logger.info("Relay subscriber disconnected")
+    except Exception as e:
+        logger.error(f"Relay subscriber error: {e}")
+    finally:
+        with relay_lock:
+            relay_connections.discard(websocket)
+
+
 # ==== Static Resource Routing ====
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--udp_target",
+        type=str,
+        default=None,
+        help="远端 UDP 地址 ip:port，设置后音频走 UDP 通道（与 WebSocket relay 二选一）",
+    )
+    parser.add_argument(
+        "--mic_udp_port",
+        type=int,
+        default=None,
+        help="接收远端麦克风 UDP 音频的端口（配合 remote_mic_udp.py），"
+        "设置后浏览器可勾选「远程麦克风」而不采集本机麦克风",
+    )
+    args = parser.parse_args()
+
+    if args.udp_target:
+        udp_sender = UdpSender(args.udp_target)
+
+    if args.mic_udp_port:
+        threading.Thread(target=mic_vad_worker, daemon=True).start()
+        threading.Thread(
+            target=mic_udp_receiver, args=(args.mic_udp_port,), daemon=True
+        ).start()
 
     logger.info(f"Server starting on http://localhost:{Config.PORT}")
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT)

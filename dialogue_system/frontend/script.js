@@ -11,6 +11,7 @@ waveformCanvas.height = 100;
 let audioContext, analyser, dataArray, source, stream, processor;
 let animationId = null;
 let listening = false;
+let remoteMicMode = false; // 服务端告知的麦克风模式：true = 使用 TCP 远端麦克风
 
 // --- ASR Audio Context is separate from TTS Audio Context ---
 let ttsContext = null;
@@ -61,6 +62,10 @@ socket.onmessage = (event) => {
       case 'connect_ack':
         console.log('Connection confirmed:', payload);
         break;
+      case 'mic_mode':
+        remoteMicMode = payload.mode === 'remote';
+        console.log('[mic] mode =', payload.mode);
+        break;
       case 'text_response':
         console.log('[LLM]', payload.text);
         break;
@@ -91,6 +96,10 @@ socket.onmessage = (event) => {
       case 'resume_audio':
         if (ttsNode) ttsNode.port.postMessage({ type: 'resume' });
         updateCircleState('SPEAKING');
+        break;
+      case 'remote_mic_waveform':
+        // 远端麦克风音频（int16 base64）→ 画实时波形，确认远端音频链路
+        drawRemoteMicWaveform(payload);
         break;
       default:
         console.log('Unknown event:', eventName);
@@ -250,6 +259,20 @@ startBtn.addEventListener('click', async () => {
     if (!ttsContext) await initTTSAudioEngine();
     if (ttsContext.state === 'suspended') ttsContext.resume();
 
+    const useRemoteMic = remoteMicMode; // 服务端决定：app.py 带 --mic_tcp_port 则使用远端麦克风
+    if (useRemoteMic) {
+      // 远端麦克风模式：不采集本机麦克风，音频由 remote_mic.py 通过 TCP 直接喂给服务端
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          event: "config_audio",
+          data: { sample_rate: 16000, source: "remote_mic" }
+        }));
+      }
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      return;
+    }
+
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
     // Separate context for recording to avoid sample rate mess
@@ -355,6 +378,32 @@ function drawUserWaveform() {
     x += sliceWidth;
   }
   ctx.stroke();
+}
+
+// 画远端麦克风输入波形（int16 base64），确认远端音频链路实时可见
+function drawRemoteMicWaveform(b64) {
+  if (!b64) return;
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const i16 = new Int16Array(bytes.buffer);
+    const mid = waveformCanvas.height / 2;
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#4ade80';
+    ctx.beginPath();
+    for (let i = 0; i < i16.length; i++) {
+      const x = (i / i16.length) * waveformCanvas.width;
+      const y = mid - (i16[i] / 32768) * (waveformCanvas.height / 2 - 4);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  } catch (e) {
+    console.error('waveform decode error:', e);
+  }
 }
 
 // ==================== Assistant Circle Animation ====================
