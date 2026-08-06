@@ -61,6 +61,8 @@ class TcpAudioSender:
     帧格式: [type:1B][len:4B big-endian][payload]
       type=0 音频（payload = int16 PCM，整段一帧）
       type=1 控制（payload = 控制码，0=stop/1=pause/2=resume）
+      type=2 end（payload = 对应 LLM chunk 的文本 UTF-8，可为空）：
+             标记一个 LLM chunk 语音的结束边界，接收端无需处理，直接跳过即可
     断线后由后台线程自动重连；stop 控制帧可实现即时打断。
     """
 
@@ -84,6 +86,7 @@ class TcpAudioSender:
             if sock is None:
                 try:
                     s = socket.create_connection(self.addr, timeout=5)
+                    s.settimeout(3.0)  # 发送超时：半开连接时避免 sendall 永久阻塞卡死事件循环
                     with self._lock:
                         self.sock = s
                     logger.info(f"TCP player connected: {self.addr}")
@@ -118,13 +121,14 @@ class TcpAudioSender:
             return  # 未连接：直接丢弃（音频断流 / stop 无需送达）
         try:
             sock.sendall(pkt)
-        except OSError:
+        except OSError as e:
             with self._lock:
                 self.sock = None
             try:
                 sock.close()
             except OSError:
                 pass
+            logger.info(f"TCP player send failed: {e}, will reconnect")
 
     def send_audio(self, data: bytes):
         self._send(0, data)
@@ -141,11 +145,22 @@ class TcpAudioSender:
             self._sent_bytes = 0
             self._log_ts = now
 
-    def send_event(self, event: str, data):
+    def send_event(self, event: str, data, reason: str = ""):
         code = CTRL_CODE.get(event)
         if code is None:
             return  # UI-only events are not forwarded
         self._send(1, bytes([code]))
+        suffix = f" (reason: {reason})" if reason else ""
+        logger.info(f"[tcp] control frame sent: {event} (code={code}){suffix}")
+
+    def send_end(self, text: str = ""):
+        """发送 end 信号（type=2）：标记一个 LLM chunk 对应语音的结束边界。
+
+        纯边界标记，接收端无需做出反应；payload 为该 chunk 的文本（UTF-8），可为空。
+        与音频帧走同一连接、同一把锁，保证紧跟在该 chunk 的最后一个音频帧之后。
+        """
+        self._send(2, text.encode("utf-8"))
+        logger.info(f"[tcp] end frame sent (type=2) chunk: {text!r}")
 
     def close(self):
         """主动断开与播放端的连接；播放端收到断连即清空缓冲，实现打断静音（不依赖 stop 控制帧）。"""
@@ -200,7 +215,7 @@ class ChatSession:
     def stop_event(self):
         return self._stop_event
 
-    def interrupt(self):
+    def interrupt(self, reason: str = ""):
         """Interrupts current inference or audio playback."""
         self._stop_event.set()
         emit_to_room(self.client_id, "stop_audio", {"message": "interrupt"})
@@ -208,7 +223,7 @@ class ChatSession:
         # 向远端播放器发送 stop 控制帧（type=1, code=0），播放端清空缓冲立即静音。
         # 不断开 TCP 连接：打断后下一轮 TTS 可直接复用连接推送，避免断连/重连时序问题
         if tcp_sender is not None:
-            tcp_sender.send_event("stop_audio", None)
+            tcp_sender.send_event("stop_audio", None, reason=reason)
 
     def pause(self):
         """Pauses audio playback."""
@@ -405,7 +420,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
             session.interruption_time = None
 
         # 3. Preparation for Response
-        session.interrupt()  # Signal previous threads to stop
+        session.interrupt(reason="new_utterance")  # Signal previous threads to stop
         session.reset_interrupt()  # Create a fresh event for this new thread
 
         # Capture the specific stop_event for this execution cycle
@@ -483,6 +498,10 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 total_audio_duration += len(wav_chunk) / 48000.0
 
                 emit_to_room(client_id, "audio_chunk", wav_chunk)
+
+            # 每个 LLM chunk 的语音已发送完，在 TCP 流上追加 end 信号标记句子边界
+            if tcp_sender is not None:
+                tcp_sender.send_end(chunk)
 
             if current_stop_event.is_set():
                 interrupted = True
@@ -642,7 +661,7 @@ def mic_vad_worker():
                     )
                     if session.interruption_time is None:
                         session.interruption_time = time.time()
-                    session.interrupt()
+                    session.interrupt(reason="barge_in(mic_tcp)")
                 else:
                     logger.info(
                         f"[{session.client_id}] VAD Process (mic-tcp)"
@@ -810,7 +829,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info(f"[{client_id}] Barge-in detected at VAD nonidle")
                         if session.interruption_time is None:
                             session.interruption_time = time.time()
-                        session.interrupt()
+                        session.interrupt(reason="barge_in(browser)")
                     else:
                         logger.info(  # [Timing] VAD roundtrip: audio in → utterance out
                             f"[{client_id}] VAD Process: {_t_vad_done - _t_vad_recv:.3f}s"
