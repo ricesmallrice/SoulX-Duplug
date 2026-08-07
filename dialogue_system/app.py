@@ -61,8 +61,6 @@ class TcpAudioSender:
     帧格式: [type:1B][len:4B big-endian][payload]
       type=0 音频（payload = int16 PCM，整段一帧）
       type=1 控制（payload = 控制码，0=stop/1=pause/2=resume）
-      type=2 end（payload = 对应 LLM chunk 的文本 UTF-8，可为空）：
-             标记一个 LLM chunk 语音的结束边界，接收端无需处理，直接跳过即可
     断线后由后台线程自动重连；stop 控制帧可实现即时打断。
     """
 
@@ -157,17 +155,6 @@ class TcpAudioSender:
         logger.info(
             f"[tcp] control frame {'sent' if sent else 'dropped'}: "
             f"{event} (code={code}){suffix}"
-        )
-
-    def send_end(self, text: str = ""):
-        """发送 end 信号（type=2）：标记一个 LLM chunk 对应语音的结束边界。
-
-        纯边界标记，接收端无需做出反应；payload 为该 chunk 的文本（UTF-8），可为空。
-        与音频帧走同一连接、同一把锁，保证紧跟在该 chunk 的最后一个音频帧之后。
-        """
-        sent = self._send(2, text.encode("utf-8"))
-        logger.info(
-            f"[tcp] end frame {'sent' if sent else 'dropped'} (type=2) chunk: {text!r}"
         )
 
     def close(self):
@@ -506,10 +493,6 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 total_audio_duration += len(wav_chunk) / 48000.0
 
                 emit_to_room(client_id, "audio_chunk", wav_chunk)
-
-            # 每个 LLM chunk 的语音已发送完，在 TCP 流上追加 end 信号标记句子边界
-            if tcp_sender is not None:
-                tcp_sender.send_end(chunk)
 
             if current_stop_event.is_set():
                 interrupted = True
