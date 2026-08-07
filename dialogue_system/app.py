@@ -113,14 +113,16 @@ class TcpAudioSender:
                         pass
                     logger.info(f"TCP player disconnected: {self.addr}")
 
-    def _send(self, ptype: int, payload: bytes):
+    def _send(self, ptype: int, payload: bytes) -> bool:
+        """写入 TCP 播放连接；返回 True=已交给内核发送队列，False=未连接或发送失败被丢弃。"""
         pkt = struct.pack(">BI", ptype, len(payload)) + payload
         with self._lock:
             sock = self.sock
         if sock is None:
-            return  # 未连接：直接丢弃（音频断流 / stop 无需送达）
+            return False  # 未连接：直接丢弃（音频断流 / stop 无需送达）
         try:
             sock.sendall(pkt)
+            return True
         except OSError as e:
             with self._lock:
                 self.sock = None
@@ -129,6 +131,7 @@ class TcpAudioSender:
             except OSError:
                 pass
             logger.info(f"TCP player send failed: {e}, will reconnect")
+            return False
 
     def send_audio(self, data: bytes):
         self._send(0, data)
@@ -149,9 +152,12 @@ class TcpAudioSender:
         code = CTRL_CODE.get(event)
         if code is None:
             return  # UI-only events are not forwarded
-        self._send(1, bytes([code]))
+        sent = self._send(1, bytes([code]))
         suffix = f" (reason: {reason})" if reason else ""
-        logger.info(f"[tcp] control frame sent: {event} (code={code}){suffix}")
+        logger.info(
+            f"[tcp] control frame {'sent' if sent else 'dropped'}: "
+            f"{event} (code={code}){suffix}"
+        )
 
     def send_end(self, text: str = ""):
         """发送 end 信号（type=2）：标记一个 LLM chunk 对应语音的结束边界。
@@ -159,8 +165,10 @@ class TcpAudioSender:
         纯边界标记，接收端无需做出反应；payload 为该 chunk 的文本（UTF-8），可为空。
         与音频帧走同一连接、同一把锁，保证紧跟在该 chunk 的最后一个音频帧之后。
         """
-        self._send(2, text.encode("utf-8"))
-        logger.info(f"[tcp] end frame sent (type=2) chunk: {text!r}")
+        sent = self._send(2, text.encode("utf-8"))
+        logger.info(
+            f"[tcp] end frame {'sent' if sent else 'dropped'} (type=2) chunk: {text!r}"
+        )
 
     def close(self):
         """主动断开与播放端的连接；播放端收到断连即清空缓冲，实现打断静音（不依赖 stop 控制帧）。"""
