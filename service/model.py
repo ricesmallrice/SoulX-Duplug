@@ -4,7 +4,9 @@ import random
 import numpy as np
 import math
 import time
+import asyncio
 import re
+from concurrent.futures import ThreadPoolExecutor
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
 
@@ -15,6 +17,10 @@ from utils.backchannel_utils import check_backchannel, remove_leading_backchanne
 from config.config import RunConfig
 from model.model import State_Prediction_Model
 from transformers import WhisperFeatureExtractor
+
+# 云端整句 STT（api.py 在项目根目录）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from api import recognize_pcm, RESULT_TIMEOUT_SECONDS
 
 
 class TurnModel:
@@ -142,6 +148,45 @@ class TurnModel:
         self.speech_detected = False
         self.wait_idle_cnt = 0
         self.monitoring_wait_silence = False
+
+    def _recognize_utterance(self):
+        """
+        整句识别：优先云端 AIChain API（整段 buffer_for_asr 一次上传），
+        失败/超时降级本地 cascade_asr。
+
+        返回 (text, language, source)，source ∈ {"api", "local"}。
+        """
+        pcm = (
+            np.clip(self.buffer_for_asr, -1.0, 1.0) * 32767.0
+        ).astype(np.int16).tobytes()
+
+        def _worker():
+            # model.process 跑在 async 事件循环线程上，不能直接 asyncio.run；
+            # 在独立 worker 线程里新建事件循环跑云端识别。
+            return asyncio.run(recognize_pcm(pcm))
+
+        t_cloud = time.time()  # [CloudSTT] 云端总耗时计时起点
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                # 外层兜底超时 > 内部 RESULT_TIMEOUT_SECONDS，防止 worker 永久卡住
+                text, language = ex.submit(_worker).result(
+                    timeout=RESULT_TIMEOUT_SECONDS + 2
+                )
+            print(
+                f"[CloudSTT] OK | 总耗时: {time.time() - t_cloud:.3f}s "
+                f"| Lang: {language} | Text: {text}"
+            )
+            return text, language, "api"
+        except Exception as exc:
+            print(
+                f"[CloudSTT] FAIL: {type(exc).__name__}: {exc} "
+                f"| 耗时: {time.time() - t_cloud:.3f}s -> fallback local"
+            )
+            text = self.cascade_asr.recognize(
+                self.buffer_for_asr, self.sampling_rate
+            )
+            return text, "unknown", "local"
 
     def _log(self, *args, **kwargs):
         # only for debugging, too much logging will slow down the inference
@@ -277,16 +322,15 @@ class TurnModel:
                 if self.wait_idle_cnt >= self.config.infer_config["max_wait_num"]:
                     self._log("Continuous silence after wait, triggering reply")
                     if self.speech_detected:
-                        segment = self.cascade_asr.recognize(
-                            self.buffer_for_asr, self.sampling_rate
-                        )
+                        segment, language, source = self._recognize_utterance()
                         vad_dur = time.time() - self._vad_start_time
-                        print(f"[TurnTiming] VAD End: {vad_dur:.3f}s | Text: {segment}")
+                        print(f"[TurnTiming] VAD End ({source}): {vad_dur:.3f}s | Lang: {language} | Text: {segment}")
                         # self.clear_turn()
                         self.reset()
                         return {
                             "state": "speak",
                             "text": segment,
+                            "language": language,
                             "asr_segment": delta_text,
                             "asr_buffer": asr_buffer,
                         }
@@ -357,16 +401,15 @@ class TurnModel:
                 self.buffer_for_asr = np.concatenate(
                     [self.buffer_for_asr, process_chunk]
                 )
-                segment = self.cascade_asr.recognize(
-                    self.buffer_for_asr, self.sampling_rate
-                )
+                segment, language, source = self._recognize_utterance()
                 vad_dur = time.time() - self._vad_start_time
-                print(f"[TurnTiming] VAD End: {vad_dur:.3f}s | Text: {segment}")
+                print(f"[TurnTiming] VAD End ({source}): {vad_dur:.3f}s | Lang: {language} | Text: {segment}")
                 # self.clear_turn()
                 self.reset()
                 return {
                     "state": "speak",
                     "text": segment,
+                    "language": language,
                     "asr_segment": delta_text,
                     "asr_buffer": asr_buffer,
                 }

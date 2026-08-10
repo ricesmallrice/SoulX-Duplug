@@ -15,6 +15,7 @@ TCP 帧格式（与 app.py 的 TcpAudioSender 对应）:
     [type:1B][len:4B big-endian][payload]
     type=0 音频: payload = 裸 int16 小端 PCM（24000 Hz 单声道，整段一帧）
     type=1 控制: payload = 控制码（0=stop, 1=pause, 2=resume）
+    type=2 句尾: 每句话最后一帧，仅根据 type 判断，不解析 payload
     TCP 有序可靠，无需重排。
 
 打断机制:
@@ -51,6 +52,7 @@ mute_flag = threading.Event()  # 打断标志：置位后播放线程放弃当�
 # 转发队列：--forward 指定下游（如 audio_face_stream）时，收到的帧原样再发一份。
 # 与播放路径解耦，下游没连上/发不动都不影响本机出声；但打断时与播放同步清空。
 forward_q = queue.Queue(maxsize=256)
+forward_control_q = queue.Queue(maxsize=32)
 _forward_enabled = False
 
 # --forward-gate：先扣住音频，等下游（audio_face_stream）推理完并下发 ROS 后
@@ -155,6 +157,8 @@ def clear_all_buffers():
         audio_q.queue.clear()
     with forward_q.mutex:
         forward_q.queue.clear()
+    with forward_control_q.mutex:
+        forward_control_q.queue.clear()
     with _hold_lock:
         _hold_buf.clear()
         _hold_since = None
@@ -178,26 +182,35 @@ def _enqueue_forward(ptype, payload):
     """
     if not _forward_enabled:
         return
+    if ptype == 2:
+        # END 一进入转发流程就打印；放在 put 之前，避免闸门模式下 put 阻塞时永远打不出
+        print("[forward] end boundary handed to forward queue")
     if _forward_gated:
         forward_q.put((ptype, payload))
-        return
-    try:
-        forward_q.put_nowait((ptype, payload))
-    except queue.Full:
+    else:
         try:
-            forward_q.get_nowait()
             forward_q.put_nowait((ptype, payload))
-        except (queue.Empty, queue.Full):
-            pass
+        except queue.Full:
+            try:
+                forward_q.get_nowait()
+                forward_q.put_nowait((ptype, payload))
+            except (queue.Empty, queue.Full):
+                pass
+
+
+def _enqueue_forward_control(ptype, payload, clear_audio=False):
+    """优先转发控制帧/END，避免 END 排在不足 1 秒尾音频后造成 ACK 死锁。"""
+    if not _forward_enabled:
+        return
+    if clear_audio:
+        with forward_q.mutex:
+            forward_q.queue.clear()
+    forward_control_q.put((ptype, payload))
 
 
 def _enqueue_forward_priority(ptype, payload):
     """打断控制帧优先转发：丢弃旧音频，让下游立刻收到 stop。"""
-    if not _forward_enabled:
-        return
-    with forward_q.mutex:
-        forward_q.queue.clear()
-    forward_q.put((ptype, payload))
+    _enqueue_forward_control(ptype, payload, clear_audio=True)
 
 
 def _hold_audio(payload):
@@ -292,9 +305,12 @@ def forward_worker(target):
     while True:
         conn, ack_buf = _drain_forward_acks(conn, ack_buf)
         try:
-            ptype, payload = forward_q.get(timeout=0.02)
+            ptype, payload = forward_control_q.get_nowait()
         except queue.Empty:
-            continue
+            try:
+                ptype, payload = forward_q.get(timeout=0.02)
+            except queue.Empty:
+                continue
 
         generation = _interrupt_generation
         frame = struct.pack(">BI", ptype, len(payload)) + payload
@@ -316,6 +332,10 @@ def forward_worker(target):
             try:
                 conn.settimeout(2.0)
                 conn.sendall(frame)
+                if ptype == 2:
+                    print("[forward] sent end boundary")
+                elif ptype == 1:
+                    print("[forward] sent control frame")
                 conn, ack_buf = _drain_forward_acks(conn, ack_buf)
                 break
             except OSError:
@@ -372,6 +392,9 @@ def _handle_client(conn):
                     _enqueue_forward_priority(ptype, payload)
                 else:
                     _enqueue_forward(ptype, payload)
+            elif ptype == 2:
+                print("[tcp] end control -> forwarding utterance boundary")
+                _enqueue_forward(ptype, payload)
             else:
                 _enqueue_forward(ptype, payload) #------------------------------------------------转发程序------------------------------------------------
     except OSError:
