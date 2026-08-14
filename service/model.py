@@ -156,6 +156,13 @@ class TurnModel:
 
         返回 (text, language, source)，source ∈ {"api", "local"}。
         """
+        # use_cloud=false 时跳过云端，直接用本地级联识别整句
+        if not self.config.infer_config.asr.use_cloud:
+            text = self.cascade_asr.recognize(
+                self.buffer_for_asr, self.sampling_rate
+            )
+            return text, "unknown", "local"
+
         pcm = (
             np.clip(self.buffer_for_asr, -1.0, 1.0) * 32767.0
         ).astype(np.int16).tobytes()

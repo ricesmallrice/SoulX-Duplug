@@ -22,7 +22,7 @@
 | 部署机器 | ubuntu（IP: 172.88.88.14，用户 hjadmin，CUDA 12.4）                                                                                                                                                                                                                       |
 | 分支   | dialogue-system                                                                                                                                                                                                                                                     |
 | 项目路径 | /nfs/kubeflow-data/SoulX/SoulX-Duplug                                                                                                                                                                                                                               |
-| 关键配置 | 端口: VAD 8000 / LLM 6007 / TTS 6006 / Dialogue 55556；GPU: 0=VAD+TTS，1=LLM；config/config.yaml（chunk\_size=5120、max\_wait\_num=4、asr=sensevoice）；api.py 讯飞凭证（APP\_ID/APP\_KEY/SN/SCENE=main/STT\_ENGINE\_ID=3）；Dialogue 启动参数 --tcp\_target/--mic\_tcp\_port/--headless |
+| 关键配置 | 端口: VAD 8000 / LLM 6007 / TTS 6006 / Dialogue 55556；GPU: 0=VAD+TTS，1=LLM；config/config.yaml（chunk\_size=5120、max\_wait\_num=4、asr=sensevoice、asr.use\_cloud）；api.py 讯飞凭证（APP\_ID/APP\_KEY/SN/SCENE=main/STT\_ENGINE\_ID=3）；Dialogue 启动参数 --tcp\_target/--mic\_tcp\_port/--headless |
 | 经验总结 | ①句首连发 stop 是 mistake\_len 过渡期正常现象 ②8000 看似"没启动无日志"=模型加载慢，等加载完才打印 Uvicorn running ③"no active session, dropping mic audio"=未带 --headless 且无浏览器会话                                                                                                                     |
 
 ## 3. 系统架构
@@ -240,6 +240,7 @@ IndexTTS-vLLM 文本到语音合成。
 - 用户说完（speak 出口）时，将整段 `buffer_for_asr` 音频打包上传讯飞 AIChain STT 接口，返回整句最终文本 + 语言类型
 - 本地每块级联 SenseVoice 保留（负责 VAD 状态机判断），云端只负责最终整句文本；失败/超时自动降级本地识别
 - 代码：`api.py`（`recognize_pcm()` 整段识别入口）、`service/model.py`（`_recognize_utterance()`，float32→int16 PCM 转换 + 云端/本地切换）
+- **云端/本地开关**：`config/config.yaml` 的 `asr.use_cloud` —— `true`=云端整句识别（失败自动降级本地），`false`=跳过云端、只用本地级联识别整句（行为与改造前一致，language 返回 `unknown`）。
 - 配置项（api.py 顶部常量）：`BASE_URL=wss://aichain-sh.xfyun.cn`、`APP_ID/APP_KEY`（讯飞开放平台凭证）、`SN=test_sn`、`SCENE=main`、`STT_ENGINE_ID=3`、`SAMPLE_RATE=16000`、`RESULT_TIMEOUT_SECONDS=15`（超时触发本地降级）
 - 鉴权：`sha256(APP_KEY + curtime)` checksum 拼在 WS URL；协议：`conversation.user.append` 推音频（base64+endFlag）、`stt.result` 增量返回、`event.cid_end` 结束；`session.config` 关闭服务端 VAD/turnDetection，靠客户端 endFlag 切句
 
