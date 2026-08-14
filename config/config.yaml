@@ -28,4 +28,5 @@ infer_config:
   asr:
     model_name: sensevoice
     # model_name: sensevoice/paraformer/whisper
+    use_cloud: true  # true=云端整句识别(AIChain)；false=只用本地级联
     language: auto
