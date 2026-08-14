@@ -228,7 +228,13 @@ class IndexTTS:
         return filtered_latent
 
     async def infer(
-        self, audio_prompt: List[str], text, output_path=None, verbose=False, seed=None
+        self,
+        audio_prompt: List[str],
+        text,
+        output_path=None,
+        verbose=False,
+        seed=None,
+        cancel_event=None,
     ):
         print(">> start inference...")
         start_time = time.perf_counter()
@@ -267,6 +273,10 @@ class IndexTTS:
         speech_conditioning_latent = speech_conditioning_latent / len(auto_conditioning)
 
         for sent in sentences:
+            # 句级检查点：客户端已断开（cancel_event 置位）时停止剩余句子合成，及时释放 GPU
+            if cancel_event is not None and cancel_event.is_set():
+                print(">> inference cancelled (client disconnected)")
+                break
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(
                 text_tokens, dtype=torch.int32, device=self.device
@@ -283,7 +293,12 @@ class IndexTTS:
                     speech_conditioning_latent,
                     text_tokens,
                     # cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device)
+                    cancel_event=cancel_event,
                 )
+                if codes is None:
+                    # 打断发生在合成过程中（vLLM 已 abort），放弃当前句
+                    print(">> inference cancelled mid-sentence")
+                    break
                 gpt_gen_time += time.perf_counter() - m_start_time
 
                 # # remove ultra-long silence if exits
@@ -324,6 +339,9 @@ class IndexTTS:
         torch.cuda.empty_cache()
         end_time = time.perf_counter()
 
+        if not wavs:
+            # 打断导致提前停止：返回空音频（与 infer_with_ref_audio_embed 一致）
+            return (sampling_rate, np.zeros((1, 0), dtype=np.int16))
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
@@ -351,7 +369,9 @@ class IndexTTS:
             wav_data = trim_and_pad_silence(wav_data)
             return (sampling_rate, wav_data)
 
-    async def infer_with_ref_audio_embed(self, speaker: str, text):
+    async def infer_with_ref_audio_embed(
+        self, speaker: str, text, cancel_event=None
+    ):
         start_time = time.perf_counter()
         text = text.replace("嗯", "EN4")
         text = text.replace("嘿", "HEI1")
@@ -372,6 +392,10 @@ class IndexTTS:
         ]
 
         for sent in sentences:
+            # 句级检查点：客户端已断开（cancel_event 置位）时停止剩余句子合成，及时释放 GPU
+            if cancel_event is not None and cancel_event.is_set():
+                print(">> inference cancelled (client disconnected)")
+                break
             text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
             text_tokens = torch.tensor(
                 text_tokens, dtype=torch.int32, device=self.device
@@ -383,7 +407,12 @@ class IndexTTS:
                     speech_conditioning_latent,
                     text_tokens,
                     # cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device)
+                    cancel_event=cancel_event,
                 )
+                if codes is None:
+                    # 打断发生在合成过程中（vLLM 已 abort），放弃当前句
+                    print(">> inference cancelled mid-sentence")
+                    break
                 gpt_gen_time += time.perf_counter() - m_start_time
 
                 # # remove ultra-long silence if exits
@@ -423,6 +452,9 @@ class IndexTTS:
         torch.cuda.empty_cache()
         end_time = time.perf_counter()
 
+        if not wavs:
+            # 客户端断开导致提前停止：返回空音频
+            return (sampling_rate, np.zeros((1, 0), dtype=np.int16))
         wav = torch.cat(wavs, dim=1)
         # wav_length = wav.shape[-1] / sampling_rate
         # # print(f">> Total inference time: {end_time - start_time:.2f} seconds")

@@ -153,7 +153,7 @@ class UnifiedVoice(nn.Module):
         conds = self.perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 32, d)
         return conds
 
-    async def inference_speech(self, speech_conditioning_latent, text_inputs, cond_mel_lengths=None):
+    async def inference_speech(self, speech_conditioning_latent, text_inputs, cond_mel_lengths=None, cancel_event=None):
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
 
@@ -170,11 +170,22 @@ class UnifiedVoice(nn.Module):
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
         tokens_prompt = TokensPrompt(prompt=fake_inputs, multi_modal_data=multi_modal_data)
         # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
-        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=uuid.uuid4().hex)
+        request_id = uuid.uuid4().hex
+        output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id)
         # latent = []
-        async for output in output_generator:
-            # latent.append(output.hidden_states.clone())
-            pass
+        try:
+            async for output in output_generator:
+                # 逐 step 检查打断：客户端断开即中止本句合成并释放 GPU（vLLM v1 每个 step 产出一个 output）
+                if cancel_event is not None and cancel_event.is_set():
+                    print(">> vllm generation aborted (client disconnected)")
+                    await self.llm.abort(request_id)
+                    return None
+                # latent.append(output.hidden_states.clone())
+        except Exception:
+            # abort 后生成器清理可能抛异常；若确因打断则视为正常取消
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            raise
         codes = output.outputs[0].token_ids[:-2]
 
         # latent = torch.cat(latent[:-2], dim=0).unsqueeze(0)

@@ -4,6 +4,7 @@ import requests
 import io, wave
 import time
 import re
+import threading
 
 # Add path for CosyVoice to sys.path if not present
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +33,9 @@ class IndexTTS_VLLM:
         self.api_url = api_url
         self.normalizer = TextNorm()
         self.MORE_PUNCT = "'\",;:、，；：\n"
+        # 打断支持：记录当前正在进行的 TTS 请求，abort() 时关闭连接
+        self._active = None
+        self._lock = threading.Lock()
 
         data = {"text": "This is for warm up!", "character": self.speaker}
         try:
@@ -50,23 +54,39 @@ class IndexTTS_VLLM:
         data = {"text": text, "character": self.speaker}
 
         try:
-            # start_time = time.time()
-            response = requests.post(self.api_url, json=data)
-            # print(f"IndexTTS_VLLM inference time: {time.time() - start_time} seconds")
-
+            # stream=True 以便保留 response 句柄：打断时 abort() 可关闭连接，
+            # 让服务端 is_disconnected 生效，停止剩余句子合成（行为与原一致，正常路径同阻塞等待）
+            response = requests.post(self.api_url, json=data, stream=True)
+            with self._lock:
+                self._active = response
         except Exception as e:
             print(f"IndexTTS_VLLM inference failed: {e}")
             return
 
         # Convert wav bytes to int16 pcm
         try:
-            with io.BytesIO(response.content) as wav_buffer:
-                with wave.open(wav_buffer, "rb") as wav_file:
-                    yield wav_file.readframes(wav_file.getnframes())
+            try:
+                with io.BytesIO(response.content) as wav_buffer:
+                    with wave.open(wav_buffer, "rb") as wav_file:
+                        yield wav_file.readframes(wav_file.getnframes())
+            finally:
+                with self._lock:
+                    if self._active is response:
+                        self._active = None
         except Exception as e:
             print(f"Failed to convert WAV to PCM: {e}")
             # Fallback or return empty bytes if conversion fails
             return
+
+    def abort(self):
+        """打断时调用：关闭正在进行的 TTS 请求连接，让服务端检测到断开并停止合成。"""
+        with self._lock:
+            resp = self._active
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 class Cosyvoice_Streaming_VLLM:

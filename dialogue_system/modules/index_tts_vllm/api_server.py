@@ -121,7 +121,29 @@ async def tts_api(request: Request):
         character = data["character"]
 
         global tts
-        sr, wav = await tts.infer_with_ref_audio_embed(character, text)
+
+        # 客户端断开检测：后台轮询 is_disconnected，断开时置位 cancel_event，
+        # 让 infer 在句级检查点停止剩余句子合成，及时释放 GPU（避免新请求排队）
+        cancel_event = asyncio.Event()
+
+        async def _monitor_disconnect():
+            while True:
+                try:
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        return
+                except Exception:
+                    cancel_event.set()
+                    return
+                await asyncio.sleep(0.2)
+
+        monitor_task = asyncio.create_task(_monitor_disconnect())
+        try:
+            sr, wav = await tts.infer_with_ref_audio_embed(
+                character, text, cancel_event=cancel_event
+            )
+        finally:
+            monitor_task.cancel()
 
         with io.BytesIO() as wav_buffer:
             sf.write(wav_buffer, wav, sr, format="WAV")

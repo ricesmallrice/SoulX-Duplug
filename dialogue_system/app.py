@@ -221,6 +221,13 @@ class ChatSession:
     def interrupt(self, reason: str = ""):
         """Interrupts current inference or audio playback."""
         self._stop_event.set()
+        # 中断正在进行的 TTS 请求：关闭连接让 6006 服务端检测到断开，
+        # 在句级检查点停止剩余合成，释放 GPU slot，避免新一轮 TTS 排队
+        if tts is not None:
+            try:
+                tts.abort()
+            except Exception:
+                pass
         emit_to_room(self.client_id, "stop_audio", {"message": "interrupt"})
         emit_to_room(self.client_id, "circle_status", {"status": "LISTENING"})
         # 向远端播放器发送 stop 控制帧（type=1, code=0），播放端清空缓冲立即静音。
