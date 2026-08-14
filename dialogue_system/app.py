@@ -74,6 +74,7 @@ class TcpAudioSender:
         self._sent_bytes = 0
         self._log_ts = time.time()
         threading.Thread(target=self._maintain, daemon=True).start()
+        # 启动时打印一次：--tcp_target 指定后 TCP 播放通道初始化完成
         logger.info(f"TCP channel enabled -> {target}")
 
     def _maintain(self):
@@ -87,8 +88,10 @@ class TcpAudioSender:
                     s.settimeout(3.0)  # 发送超时：半开连接时避免 sendall 永久阻塞卡死事件循环
                     with self._lock:
                         self.sock = s
+                    # _maintain 线程重连成功时打印
                     logger.info(f"TCP player connected: {self.addr}")
                 except OSError as e:
+                    # 连接失败时打印，2 秒后由 _maintain 循环重试
                     logger.warning(f"TCP connect to {self.addr} failed: {e}, retry")
                     time.sleep(2)
                 continue
@@ -109,6 +112,7 @@ class TcpAudioSender:
                         sock.close()
                     except OSError:
                         pass
+                    # _maintain 探测到对端已关闭（recv 返回空）时打印
                     logger.info(f"TCP player disconnected: {self.addr}")
 
     def _send(self, ptype: int, payload: bytes) -> bool:
@@ -128,6 +132,7 @@ class TcpAudioSender:
                 sock.close()
             except OSError:
                 pass
+            # 发送音频/控制帧失败时打印；连接置空，后续由 _maintain 重连
             logger.info(f"TCP player send failed: {e}, will reconnect")
             return False
 
@@ -152,6 +157,8 @@ class TcpAudioSender:
             return  # UI-only events are not forwarded
         sent = self._send(1, bytes([code]))
         suffix = f" (reason: {reason})" if reason else ""
+        # 每次发送控制帧（stop/pause/resume）时打印；按真实发送结果打 sent / dropped，
+        # reason 标明触发来源（如 new_utterance / barge_in(mic_tcp) / barge_in(browser)）
         logger.info(
             f"[tcp] control frame {'sent' if sent else 'dropped'}: "
             f"{event} (code={code}){suffix}"
@@ -166,6 +173,7 @@ class TcpAudioSender:
                 sock.close()
             except OSError:
                 pass
+            # interrupt() 主动断开播放连接时打印（播放端收到断连即清缓冲静音）
             logger.info("TCP player connection dropped (interrupt)")
 
 
@@ -256,6 +264,7 @@ class VADModelPool:
 
     def __init__(self, model_cls, size=Config.VAD_POOL_SIZE):
         self.pool = queue.Queue(maxsize=size)
+        # 进程启动时打印一次：开始加载 VAD 模型池（模型加载慢，此后可能长时间无输出）
         logger.info(f"Initializing VAD Pool with {size} instances...")
         for _ in range(size):
             # Initialize instances without specific callbacks (bound during acquisition)
@@ -286,6 +295,7 @@ llm = QwenLLM_stream()
 # tts = Cosyvoice_Streaming_VLLM()
 tts = IndexTTS_VLLM()
 asr = None  # Placeholder for ASR client if transcription isn't handled within VAD
+# 全局单例创建完成（VAD 池 / 会话管理 / LLM / TTS）；此打印后服务才可用
 print("System initialized: VAD Pool, LLM client, TTS client ready.")
 
 
@@ -310,6 +320,7 @@ def emit_to_room(client_id, event, data):
                     message = json.dumps({"event": event, "data": data})
                     await ws.send_text(message)
             except Exception as e:
+                # 向浏览器 WS 发送消息失败时打印（音频或 JSON 事件）
                 logger.error(f"Failed to send to {client_id}: {e}")
 
         # 2. Forward to remote relay subscribers (raw bytes for audio, JSON for events)
@@ -346,6 +357,7 @@ async def _relay_forward(event, data):
                 message = json.dumps({"event": event, "data": data})
                 await rws.send_text(message)
         except Exception as e:
+            # 旁听转发（/ws/relay 订阅端）发送失败时打印，并将该连接移出订阅集合
             logger.error(f"Relay send failed: {e}")
             failed.append(rws)
 
@@ -365,6 +377,21 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         return
 
     try:
+        # ============================================================
+        # [E2E 计时起点] 用户说完、utterance 到达 55556 的时刻。
+        # 之后依次执行（耗时性质）：
+        #   1. ASR 文本确认（即时，识别已在 8000 VAD 侧完成）
+        #   2. 上轮 pending 消息结算（毫秒级）
+        #   3. interrupt(new_utterance) 打断上轮 + reset（毫秒级）
+        #   4. ASR result 日志 + user 消息入队
+        #   5. LLM 请求 → 首个 token（TTFT，大耗时①）
+        #   6. 流式循环：LLM chunk → TTS 合成 → 推音频
+        #      首个音频帧产出 = E2E First Audio（大耗时②）
+        #   7. 收尾：LLM/TTS Total → 被打断截断提交 / 未打断存 pending → E2E Complete
+        # 两个 E2E 指标均以 t_pipeline_start 为基准：
+        #   E2E First Audio = 首帧音频 - t_pipeline_start（用户感知"首声"等待）
+        #   E2E Complete    = 处理完成 - t_pipeline_start（完整一轮）
+        # ============================================================
         t_pipeline_start = time.time()  # [Timing] Pipeline start for E2E latency
         # 1. ASR Phase (Automatic Speech Recognition)
         if asr is None:
@@ -400,10 +427,13 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                     ratio = min(elapsed / session.pending_audio_duration, 1.0)
                     cutoff = int(len(final_msg) * ratio)
                     final_msg = final_msg[:cutoff]
+                    # 每轮新 utterance 开始、提交上轮 pending 消息时打印；
+                    # 上轮回复播放中途被打断 → 按已播比例截断后补进 LLM 历史
                     logger.info(
                         f"[{client_id}] Previous turn, Ratio: {ratio:.2f}, Truncated: {final_msg}"
                     )
                 else:
+                    # 上轮回复完整播放（未被打断），整段补进 LLM 历史
                     logger.info(f"[{client_id}] Previous turn completed fully.")
 
                 llm.add_message(client_id, "assistant", final_msg)
@@ -424,6 +454,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
         if current_stop_event.is_set():
             return
 
+        # 每轮 utterance 的最终文本确定后打印（源头：8000 云端/本地 ASR 结果），随后进入 LLM
         logger.info(f"[{client_id}] ASR result: {asr_text}")
         emit_to_room(client_id, "user_transcription", {"text": asr_text})
 
@@ -451,14 +482,17 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
             if current_stop_event.is_set():
                 interrupted = True
                 if session.interruption_time:
+                    # 打断发生时打印：从 barge-in 到达（interruption_time 记录）到 LLM 流式循环检测到的延迟
                     logger.info(  # [Timing] From barge-in arrival to LLM loop detection
                         f"[{client_id}] Interrupt Latency (LLM loop): {time.time() - session.interruption_time:.3f}s"
                     )
                 break
 
+            # 每收到一个 LLM 流式文本块时打印（TTFT 之后持续输出）
             logger.info(f"[{client_id}] LLM Chunk: {chunk}")
             if t_llm_first_chunk is None:
                 t_llm_first_chunk = time.time()  # [Timing] First LLM token received
+                # 第一个 LLM 块到达时打印一次：从 LLM 请求发出（t_llm_start）到首个 token 的耗时
                 logger.info(  # [Timing] Time To First Token from LLM
                     f"[{client_id}] LLM TTFT: {t_llm_first_chunk - t_llm_start:.3f}s"
                 )
@@ -474,6 +508,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 if current_stop_event.is_set():
                     interrupted = True
                     if session.interruption_time:
+                        # 打断发生时打印：从 barge-in 到 TTS 合成循环检测到的延迟
                         logger.info(  # [Timing] From barge-in arrival to TTS loop detection
                             f"[{client_id}] Interrupt Latency (TTS loop): {time.time() - session.interruption_time:.3f}s"
                         )
@@ -483,6 +518,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                     first_emit_time = time.time()
                 if t_tts_first_audio is None:
                     t_tts_first_audio = time.time()  # [Timing] First TTS audio emitted
+                    # 第一帧 TTS 音频产出时打印一次：TTS 首音频耗时（相对首个 LLM token）+ E2E 首音频耗时（相对本轮开始）
                     logger.info(  # [Timing] TTS first chunk latency + E2E first audio
                         f"[{client_id}] TTS First Audio: {t_tts_first_audio - t_llm_first_chunk:.3f}s"
                         f" | E2E First Audio: {t_tts_first_audio - t_pipeline_start:.3f}s"
@@ -497,16 +533,18 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
             if current_stop_event.is_set():
                 interrupted = True
                 if session.interruption_time:
+                    # 打断发生时打印：一个 LLM chunk 的 TTS 合成完后才检测到 stop（post-TTS）的延迟
                     logger.info(  # [Timing] From barge-in arrival to post-TTS detection
                         f"[{client_id}] Interrupt Latency (post-TTS): {time.time() - session.interruption_time:.3f}s"
                     )
                 break
 
-        # [Timing] LLM & TTS total generation duration
+        # 本轮所有 LLM 流式块接收完时打印：LLM 总耗时（从首个 token 到结束）
         if t_llm_first_chunk is not None:
             logger.info(
                 f"[{client_id}] LLM Total: {time.time() - t_llm_first_chunk:.3f}s"
             )
+        # 本轮所有 TTS 音频合成完时打印：TTS 总耗时（从首音频到结束）
         if t_tts_first_audio is not None:
             logger.info(
                 f"[{client_id}] TTS Total: {time.time() - t_tts_first_audio:.3f}s"
@@ -519,6 +557,7 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 ratio = min(elapsed_time / total_audio_duration, 1.0)
                 cutoff_length = int(len(message_to_add) * ratio)
                 message_to_add = message_to_add[:cutoff_length]
+                # 本轮被用户打断时打印：按已播放比例截断回复文本，立即提交进 LLM 历史
                 logger.info(
                     f"[{client_id}] Interrupted mid-stream. Ratio: {ratio:.2f}. Truncated message: {message_to_add}"
                 )
@@ -544,11 +583,13 @@ def pipeline_worker(client_id, audio_segment, sample_rate):
                 session.pending_start_time = first_emit_time
                 session.interruption_time = None
 
+        # 每轮 pipeline 结束时打印：从 utterance 到达（t_pipeline_start）到处理完成的端到端总耗时
         logger.info(  # [Timing] Total E2E pipeline time (start → finish)
             f"[{client_id}] E2E Complete: {time.time() - t_pipeline_start:.3f}s"
         )
 
     except Exception as e:
+        # pipeline 任一步骤抛异常时打印（含 traceback），用于定位 ASR/LLM/TTS 环节故障
         logger.error(f"Error in pipeline for {client_id}: {e}", exc_info=True)
 
 
@@ -573,6 +614,7 @@ def start_headless_session():
     session = session_manager.create_session(client_id, vad_instance, None)
     session.is_active = True
     session.uses_remote_mic = True
+    # headless 模式启动时打印一次：常驻 system 会话创建完成，持续对话并接收远端麦克风
     logger.info(
         f"[{client_id}] Headless session initialized (persistent, remote mic)"
     )
@@ -630,6 +672,8 @@ def mic_vad_worker():
         session = pick_mic_session()
         if session is None:
             dropped += 1
+            # 远端麦克风音频没有归属会话时打印（每丢 50 块一次）：
+            # 典型原因 = 未带 --headless 且无浏览器会话
             if dropped % 50 == 1:
                 logger.warning(
                     f"[mic-tcp] no active session, dropping mic audio "
@@ -647,6 +691,7 @@ def mic_vad_worker():
             if segment is not None:
                 if isinstance(segment, list) and segment[0] is None:
                     # Barge-in（打断当前回复）
+                    # 远端麦克风在 AI 说话期间检测到用户插话（VAD 判 nonidle）时打印，触发打断
                     logger.info(
                         f"[{session.client_id}] Barge-in detected at VAD nonidle (mic-tcp)"
                     )
@@ -654,6 +699,7 @@ def mic_vad_worker():
                         session.interruption_time = time.time()
                     session.interrupt(reason="barge_in(mic_tcp)")
                 else:
+                    # 远端麦克风说完一句（VAD 返回 speak 文本）时打印，随后开 pipeline_worker 处理
                     logger.info(
                         f"[{session.client_id}] VAD Process (mic-tcp)"
                         f" | Utterance: {segment}"
@@ -664,6 +710,7 @@ def mic_vad_worker():
                         daemon=True,
                     ).start()
         except Exception as e:
+            # 远端麦克风音频送 VAD 异常时打印（含 traceback）
             logger.error(f"[mic-tcp] VAD process failed: {e}", exc_info=True)
 
 
@@ -689,12 +736,14 @@ def mic_tcp_receiver(port):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
     srv.listen(4)
+    # 启动时打印一次：mic_tcp_receiver 线程开始监听远端麦克风端口
     logger.info(f"[mic-tcp] listening on 0.0.0.0:{port} for remote microphone")
     while True:
         try:
             conn, addr = srv.accept()
         except OSError:
             continue
+        # 远端麦克风（remote_mic.py）建立 TCP 连接时打印
         logger.info(f"[mic-tcp] mic client connected: {addr}")
         threading.Thread(target=_mic_tcp_client, args=(conn,), daemon=True).start()
 
@@ -729,6 +778,7 @@ def _mic_tcp_client(conn):
             conn.close()
         except OSError:
             pass
+        # 远端麦克风连接断开/超时退出时打印
         logger.info("[mic-tcp] mic client disconnected")
 
 
@@ -737,6 +787,7 @@ def _mic_tcp_client(conn):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     client_id = str(uuid.uuid4())
+    # 浏览器打开页面建立 WebSocket 时打印（client_id 为该会话唯一标识）
     logger.info(f"New connection: {client_id}")
 
     session = None
@@ -772,12 +823,14 @@ async def websocket_endpoint(websocket: WebSocket):
         emit_to_room(client_id, "connect_ack", {"client_id": client_id})
         # 告知前端麦克风模式：带 --mic_tcp_port 时用远端麦克风，否则用浏览器麦克风
         emit_to_room(client_id, "mic_mode", {"mode": MIC_MODE})
+        # 会话初始化时打印：告知前端当前麦克风模式（browser=浏览器麦克风 / remote=远端麦克风）
         logger.info(f"[{client_id}] mic_mode sent: {MIC_MODE}")
         emit_to_room(
             client_id,
             "vad_loading",
             {"state": "ready", "message": "Model loaded, ready to experience"},
         )
+        # 会话资源就绪时打印（VAD 实例获取成功、回调绑定完成）
         logger.info(f"Session initialized for {client_id}")
 
         while True:
@@ -788,6 +841,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # RuntimeError: Starlette 在收到 disconnect 后再调 receive 会抛
                 # "Cannot call receive once a disconnect message has been received"
                 # 属客户端断开时的正常竞态，按断开处理即可
+                # 浏览器断开连接时打印（含 Starlette receive 竞态导致的伪断开）
                 logger.info(f"Client disconnected: {client_id}")
                 break
 
@@ -817,11 +871,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if segment is not None:
                     if isinstance(segment, list) and segment[0] is None:
                         # Barge-in
+                        # 浏览器麦克风在 AI 说话期间检测到用户插话时打印，触发打断
                         logger.info(f"[{client_id}] Barge-in detected at VAD nonidle")
                         if session.interruption_time is None:
                             session.interruption_time = time.time()
                         session.interrupt(reason="barge_in(browser)")
                     else:
+                        # 浏览器麦克风说完一句时打印：VAD 往返耗时（音频进→文本出）+ 完整语句
                         logger.info(  # [Timing] VAD roundtrip: audio in → utterance out
                             f"[{client_id}] VAD Process: {_t_vad_done - _t_vad_recv:.3f}s"
                             f" | Utterance: {segment}"
@@ -844,27 +900,34 @@ async def websocket_endpoint(websocket: WebSocket):
                             session.interruption_time = time.time()
                         session.stop_event.set()
                         session.reset_interrupt()
+                        # 前端发送 duplex_stop 手动停止时打印
                         logger.info(f"Session manually stopped by client: {client_id}")
 
                     elif event == "config_audio":
                         # Client sending sample rate configuration
                         sr_data = payload.get("data", {})
+                        # 前端上报音频配置（采样率/麦克风来源）时打印
                         logger.info(f"[{client_id}] config_audio received: {sr_data}")
                         sr = sr_data.get("sample_rate")
                         if sr:
                             session.input_sample_rate = int(sr)
+                            # 采样率配置生效时打印
                             logger.info(f"[{client_id}] Sample rate set to {sr}")
                         # 标记使用 TCP 转发的远端麦克风，浏览器自身不再采集麦克风
                         if sr_data.get("source") == "remote_mic":
                             session.uses_remote_mic = True
+                            # 前端声明使用远端麦克风（source=remote_mic）时打印
                             logger.info(f"[{client_id}] Remote mic enabled")
 
                 except json.JSONDecodeError:
+                    # 前端文本消息不是合法 JSON 时打印（可忽略的干扰消息）
                     logger.warning(f"[{client_id}] Received invalid JSON")
 
     except WebSocketDisconnect:
+        # 会话正常断开时打印（浏览器关闭页面/断网）
         logger.info(f"Client disconnected: {client_id}")
     except Exception as e:
+        # WS 处理循环抛未捕获异常时打印（含 traceback）
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
         if session:
@@ -872,6 +935,7 @@ async def websocket_endpoint(websocket: WebSocket):
             session.stop_event.set()
             vad_pool.release(session.vad)
             session_manager.remove_session(client_id)
+        # 会话清理完成时打印：标记非活跃、释放 VAD 实例回池、移除会话
         logger.info(f"Session cleaned up: {client_id}")
 
 
@@ -889,6 +953,7 @@ async def relay_endpoint(websocket: WebSocket):
     await websocket.accept()
     with relay_lock:
         relay_connections.add(websocket)
+    # 旁听端（/ws/relay）连接时打印
     logger.info(f"Relay subscriber connected: {websocket.client.host}")
 
     try:
@@ -899,8 +964,10 @@ async def relay_endpoint(websocket: WebSocket):
                 # 可选支持 ping/pong 或自定义控制
                 logger.debug(f"Relay message ignored: {message['text']}")
     except WebSocketDisconnect:
+        # 旁听端断开时打印
         logger.info("Relay subscriber disconnected")
     except Exception as e:
+        # 旁听转发异常时打印
         logger.error(f"Relay subscriber error: {e}")
     finally:
         with relay_lock:
@@ -940,9 +1007,11 @@ if __name__ == "__main__":
 
     if args.headless:
         HEADLESS = True
+        # 启动参数校验：headless 必须有远端麦克风输入，否则拒绝启动
         if not args.mic_tcp_port:
             logger.error("--headless 需要 --mic_tcp_port（远端麦克风输入）")
             sys.exit(1)
+        # 启动参数校验：headless 缺远端播放器仅告警（可后补）
         if not args.tcp_target:
             logger.warning(
                 "--headless 未带 --tcp_target，语音将无处播放"
@@ -963,5 +1032,6 @@ if __name__ == "__main__":
         # 常驻会话在后台线程创建（vad_pool.acquire 阻塞）
         threading.Thread(target=start_headless_session, daemon=True).start()
 
+    # 服务正式启动前打印监听地址
     logger.info(f"Server starting on http://localhost:{Config.PORT}")
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
